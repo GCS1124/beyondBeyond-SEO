@@ -243,7 +243,7 @@ def check_environment(target=None, query=None, out=None):
             if target and result["http_ready"]:
                 from .engine import Crawler
                 from .evidence import capture_quality
-                from .network import Config, addresses
+                from .network import Config, addresses, check_proxied_target, configured_proxy
                 from .review import read_pages
 
                 config = Config(
@@ -257,12 +257,20 @@ def check_environment(target=None, query=None, out=None):
                     retries=0,
                 )
                 try:
-                    addresses(config.url)
-                    probes["dns"] = {
-                        "status": "PASS",
-                        "evidence": "DNS resolved and public address validation passed.",
-                        "blocks_crawling": False,
-                    }
+                    if configured_proxy(config.url):
+                        check_proxied_target(config.url)
+                        probes["dns"] = {
+                            "status": "PASS",
+                            "evidence": "BEYONDSEO_PROXY is set; the proxy resolves the host. Local targets were rejected.",
+                            "blocks_crawling": False,
+                        }
+                    else:
+                        addresses(config.url)
+                        probes["dns"] = {
+                            "status": "PASS",
+                            "evidence": "DNS resolved and public address validation passed.",
+                            "blocks_crawling": False,
+                        }
                 except (OSError, ValueError) as exc:
                     probes["dns"] = {
                         "status": "BLOCKED",

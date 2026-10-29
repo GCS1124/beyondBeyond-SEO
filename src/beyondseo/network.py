@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import ipaddress
 import math
+import os
 import re
 import socket
 import ssl
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote_plus, urljoin, urlsplit, urlunsplit
+from urllib.request import proxy_bypass_environment
 
 from .diagnostics import challenge_signal, classify_access
 
@@ -209,6 +211,76 @@ def addresses(url, allow_private=False):
     return infos
 
 
+def configured_proxy(url):
+    """Return the opt-in CONNECT proxy (host, port) for url, or None.
+
+    BEYONDSEO_PROXY=http://host:port uses that proxy; BEYONDSEO_PROXY=env uses
+    HTTPS_PROXY/HTTP_PROXY and honours NO_PROXY. Unset keeps direct connections.
+    """
+    setting = os.environ.get("BEYONDSEO_PROXY", "").strip()
+    if not setting:
+        return None
+    host = urlsplit(url).hostname or ""
+    if setting.lower() == "env":
+        if proxy_bypass_environment(host):
+            return None
+        setting = next(
+            (
+                os.environ.get(name, "").strip()
+                for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+                if os.environ.get(name, "").strip()
+            ),
+            "",
+        )
+        if not setting:
+            return None
+    proxy = urlsplit(setting if "://" in setting else "http://" + setting)
+    if proxy.scheme != "http" or not proxy.hostname:
+        raise ValueError("unsupported_proxy")
+    return proxy.hostname, proxy.port or 80
+
+
+def check_proxied_target(url, allow_private=False):
+    """Reject local targets before tunnelling; the proxy resolves ordinary names."""
+    if allow_private:
+        return
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise ValueError("private_or_nonpublic_address")
+    try:
+        ip = ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        return
+    if not ip.is_global:
+        raise ValueError("private_or_nonpublic_address")
+
+
+def open_proxy_tunnel(proxy, host, port, deadline):
+    """Open an HTTP CONNECT tunnel to host:port through proxy."""
+    sock = socket.create_connection(proxy, timeout=max(0.1, deadline - time.monotonic()))
+    try:
+        target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        sock.sendall(
+            f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nUser-Agent: {USER_AGENT}\r\n\r\n".encode("ascii")
+        )
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("proxy closed the connection")
+            reply += chunk
+            if len(reply) > 65536:
+                raise OSError("proxy response too large")
+        status_line = reply.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = status_line.split()
+        if len(parts) < 2 or parts[1] != "200":
+            raise OSError(f"proxy CONNECT failed: {status_line}")
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
 @dataclass
 class Response:
     url: str
@@ -249,24 +321,28 @@ class Transport:
             raise ValueError("unsupported_http_method")
         p = urlsplit(url)
         deadline = time.monotonic() + self.config.timeout
-        infos = addresses(url, self.config.allow_private)
-        sock = None
-        last = None
-        for family, kind, proto, _, addr in infos:
-            candidate = socket.socket(family, kind, proto)
-            candidate.settimeout(max(0.1, deadline - time.monotonic()))
-            try:
-                candidate.connect(addr)
-                sock = candidate
-                break
-            except OSError as e:
-                last = e
-                candidate.close()
-        if sock is None:
-            raise last or OSError("connect failed")
-        conn = http.client.HTTPConnection(
-            p.hostname, p.port or (443 if p.scheme == "https" else 80), timeout=self.config.timeout
-        )
+        port = p.port or (443 if p.scheme == "https" else 80)
+        proxy = configured_proxy(url)
+        if proxy:
+            check_proxied_target(url, self.config.allow_private)
+            sock = open_proxy_tunnel(proxy, p.hostname, port, deadline)
+        else:
+            infos = addresses(url, self.config.allow_private)
+            sock = None
+            last = None
+            for family, kind, proto, _, addr in infos:
+                candidate = socket.socket(family, kind, proto)
+                candidate.settimeout(max(0.1, deadline - time.monotonic()))
+                try:
+                    candidate.connect(addr)
+                    sock = candidate
+                    break
+                except OSError as e:
+                    last = e
+                    candidate.close()
+            if sock is None:
+                raise last or OSError("connect failed")
+        conn = http.client.HTTPConnection(p.hostname, port, timeout=self.config.timeout)
         try:
             if p.scheme == "https":
                 sock = ssl.create_default_context().wrap_socket(sock, server_hostname=p.hostname)
